@@ -64,7 +64,9 @@
 #elif defined(_WIN32)
 #  include "third_party/win32/getopt.h"
 #else
+extern "C" {
 #  include "third_party/getopt_long.h"
+}
 #endif
 
 #ifdef _WIN32
@@ -127,6 +129,8 @@ Common options:
     -x, --show-compression     show compression statistics
     -p, --show-config          show current configuration options in
                                human-readable format
+        --show-log-stats       print statistics counters from the stats log
+                               in human-readable format
     -s, --show-stats           show summary of configuration and statistics
                                counters in human-readable format
     -z, --zero-stats           zero statistics counters
@@ -203,7 +207,8 @@ private:
 };
 
 inline Failure::Failure(Statistic statistic, nonstd::optional<int> exit_code)
-  : m_statistic(statistic), m_exit_code(exit_code)
+  : m_statistic(statistic),
+    m_exit_code(exit_code)
 {
 }
 
@@ -396,14 +401,14 @@ do_remember_include_file(Context& ctx,
     return true;
   }
 
-  if (ctx.included_files.find(path) != ctx.included_files.end()) {
-    // Already known include file.
-    return true;
-  }
-
   // Canonicalize path for comparison; Clang uses ./header.h.
   if (Util::starts_with(path, "./")) {
     path.erase(0, 2);
+  }
+
+  if (ctx.included_files.find(path) != ctx.included_files.end()) {
+    // Already known include file.
+    return true;
   }
 
 #ifdef _WIN32
@@ -781,10 +786,10 @@ do_execute(Context& ctx,
     DEBUG_ASSERT(ctx.config.compiler_type() == CompilerType::gcc);
     args.erase_last("-fdiagnostics-color");
   }
-  int status = execute(args.to_argv().data(),
+  int status = execute(ctx,
+                       args.to_argv().data(),
                        std::move(tmp_stdout.fd),
-                       std::move(tmp_stderr.fd),
-                       &ctx.compiler_pid);
+                       std::move(tmp_stderr.fd));
   if (status != 0 && !ctx.diagnostics_color_failed
       && ctx.config.compiler_type() == CompilerType::gcc) {
     auto errors = Util::read_file(tmp_stderr.path);
@@ -1092,6 +1097,8 @@ to_cache(Context& ctx,
     throw Failure(Statistic::internal_error);
   }
 
+  MTR_BEGIN("file", "file_put");
+
   const auto result_file = look_up_cache_file(
     ctx.config.cache_dir(), *ctx.result_name(), Result::k_file_suffix);
   ctx.set_result_path(result_file.path);
@@ -1129,11 +1136,15 @@ to_cache(Context& ctx,
                         ctx.args_info.output_dwo);
   }
 
-  auto error = result_writer.finalize();
-  if (error) {
-    LOG("Error: {}", *error);
-  } else {
+  const auto file_size_and_count_diff = result_writer.finalize();
+  if (file_size_and_count_diff) {
     LOG("Stored in cache: {}", result_file.path);
+    ctx.counter_updates.increment(Statistic::cache_size_kibibyte,
+                                  file_size_and_count_diff->size_kibibyte);
+    ctx.counter_updates.increment(Statistic::files_in_cache,
+                                  file_size_and_count_diff->count);
+  } else {
+    LOG("Error: {}", file_size_and_count_diff.error());
   }
 
   auto new_result_stat = Stat::stat(result_file.path, Stat::OnError::log);
@@ -1423,14 +1434,17 @@ hash_common_info(const Context& ctx,
 
   if ((!should_rewrite_dependency_target(ctx.args_info)
        && ctx.args_info.generating_dependencies)
-      || ctx.args_info.seen_split_dwarf) {
-    // The output object file name is part of the .d file, so include the path
-    // in the hash if generating dependencies.
+      || ctx.args_info.seen_split_dwarf || ctx.args_info.profile_arcs) {
+    // If generating dependencies: The output object file name is part of the .d
+    // file, so include the path in the hash.
     //
-    // Object files include a link to the corresponding .dwo file based on the
-    // target object filename when using -gsplit-dwarf, so hashing the object
-    // file path will do it, although just hashing the object file base name
-    // would be enough.
+    // When using -gsplit-dwarf: Object files include a link to the
+    // corresponding .dwo file based on the target object filename, so hashing
+    // the object file path will do it, although just hashing the object file
+    // base name would be enough.
+    //
+    // When using -fprofile-arcs (including implicitly via --coverage): the
+    // object file contains a .gcda path based on the object file path.
     hash.hash_delimiter("object file");
     hash.hash(ctx.args_info.output_obj);
   }
@@ -1650,8 +1664,21 @@ calculate_result_name(Context& ctx,
     }
 
     if (Util::starts_with(args[i], "-specs=")
-        || Util::starts_with(args[i], "--specs=")) {
-      std::string path = args[i].substr(args[i].find('=') + 1);
+        || Util::starts_with(args[i], "--specs=")
+        || (args[i] == "-specs" || args[i] == "--specs")
+        || args[i] == "--config") {
+      std::string path;
+      size_t eq_pos = args[i].find('=');
+      if (eq_pos == std::string::npos) {
+        if (i + 1 >= args.size()) {
+          LOG("missing argument for \"{}\"", args[i]);
+          throw Failure(Statistic::bad_compiler_arguments);
+        }
+        path = args[i + 1];
+        i++;
+      } else {
+        path = args[i].substr(eq_pos + 1);
+      }
       auto st = Stat::stat(path, Stat::OnError::log);
       if (st) {
         // If given an explicit specs file, then hash that file, but don't
@@ -2184,9 +2211,17 @@ finalize_stats_and_trigger_cleanup(Context& ctx)
   }
 
   if (!config.log_file().empty() || config.debug()) {
-    const auto result = Statistics::get_result(ctx.counter_updates);
+    const auto result = Statistics::get_result_message(ctx.counter_updates);
     if (result) {
       LOG("Result: {}", *result);
+    }
+  }
+
+  if (!config.stats_log().empty()) {
+    const auto result_id = Statistics::get_result_id(ctx.counter_updates);
+    if (result_id) {
+      Statistics::log_result(
+        config.stats_log(), ctx.args_info.input_file, *result_id);
     }
   }
 
@@ -2284,6 +2319,7 @@ cache_compilation(int argc, const char* const* argv)
   bool fall_back_to_original_compiler = false;
   Args saved_orig_args;
   nonstd::optional<mode_t> original_umask;
+  std::string saved_temp_dir;
 
   {
     Context ctx;
@@ -2319,10 +2355,12 @@ cache_compilation(int argc, const char* const* argv)
 
       LOG_RAW("Failed; falling back to running the real compiler");
 
+      saved_temp_dir = ctx.config.temporary_dir();
       saved_orig_args = std::move(ctx.orig_args);
       auto execv_argv = saved_orig_args.to_argv();
       LOG("Executing {}", Util::format_argv_for_logging(execv_argv.data()));
-      // Run execv below after ctx and finalizer have been destructed.
+      // Execute the original command below after ctx and finalizer have been
+      // destructed.
     }
   }
 
@@ -2331,8 +2369,9 @@ cache_compilation(int argc, const char* const* argv)
       umask(*original_umask);
     }
     auto execv_argv = saved_orig_args.to_argv();
-    execv(execv_argv[0], const_cast<char* const*>(execv_argv.data()));
-    throw Fatal("execv of {} failed: {}", execv_argv[0], strerror(errno));
+    execute_noreturn(execv_argv.data(), saved_temp_dir);
+    throw Fatal(
+      "execute_noreturn of {} failed: {}", execv_argv[0], strerror(errno));
   }
 
   return EXIT_SUCCESS;
@@ -2369,10 +2408,6 @@ do_cache_compilation(Context& ctx, const char* const* argv)
     throw Failure(Statistic::cache_miss);
   }
 
-  MTR_BEGIN("main", "set_up_uncached_err");
-  set_up_uncached_err();
-  MTR_END("main", "set_up_uncached_err");
-
   LOG("Command line: {}", Util::format_argv_for_logging(argv));
   LOG("Hostname: {}", Util::get_hostname());
   LOG("Working directory: {}", ctx.actual_cwd);
@@ -2389,6 +2424,8 @@ do_cache_compilation(Context& ctx, const char* const* argv)
   if (processed.error) {
     throw Failure(*processed.error);
   }
+
+  set_up_uncached_err();
 
   if (ctx.config.depend_mode()
       && (!ctx.args_info.generating_dependencies
@@ -2570,6 +2607,7 @@ handle_main_options(int argc, const char* const* argv)
     EXTRACT_RESULT,
     HASH_FILE,
     PRINT_STATS,
+    SHOW_LOG_STATS,
   };
   static const struct option options[] = {
     {"checksum-file", required_argument, nullptr, CHECKSUM_FILE},
@@ -2591,6 +2629,7 @@ handle_main_options(int argc, const char* const* argv)
     {"set-config", required_argument, nullptr, 'o'},
     {"show-compression", no_argument, nullptr, 'x'},
     {"show-config", no_argument, nullptr, 'p'},
+    {"show-log-stats", no_argument, nullptr, SHOW_LOG_STATS},
     {"show-stats", no_argument, nullptr, 's'},
     {"version", no_argument, nullptr, 'V'},
     {"zero-stats", no_argument, nullptr, 'z'},
@@ -2668,9 +2707,15 @@ handle_main_options(int argc, const char* const* argv)
       break;
     }
 
-    case PRINT_STATS:
-      PRINT_RAW(stdout, Statistics::format_machine_readable(ctx.config));
+    case PRINT_STATS: {
+      Counters counters;
+      time_t last_updated;
+      std::tie(counters, last_updated) =
+        Statistics::collect_counters(ctx.config);
+      PRINT_RAW(stdout,
+                Statistics::format_machine_readable(counters, last_updated));
       break;
+    }
 
     case 'c': // --cleanup
     {
@@ -2748,9 +2793,30 @@ handle_main_options(int argc, const char* const* argv)
       ctx.config.visit_items(configuration_printer);
       break;
 
-    case 's': // --show-stats
-      PRINT_RAW(stdout, Statistics::format_human_readable(ctx.config));
+    case SHOW_LOG_STATS: {
+      if (ctx.config.stats_log().empty()) {
+        throw Fatal("No stats log has been configured");
+      }
+      PRINT_RAW(stdout, Statistics::format_stats_log(ctx.config));
+      Counters counters = Statistics::read_log(ctx.config.stats_log());
+      auto st = Stat::stat(ctx.config.stats_log(), Stat::OnError::log);
+      PRINT_RAW(stdout,
+                Statistics::format_human_readable(counters, st.mtime(), true));
       break;
+    }
+
+    case 's': { // --show-stats
+      PRINT_RAW(stdout, Statistics::format_config_header(ctx.config));
+      Counters counters;
+      time_t last_updated;
+      std::tie(counters, last_updated) =
+        Statistics::collect_counters(ctx.config);
+      PRINT_RAW(
+        stdout,
+        Statistics::format_human_readable(counters, last_updated, false));
+      PRINT_RAW(stdout, Statistics::format_config_footer(ctx.config));
+      break;
+    }
 
     case 'V': // --version
       PRINT(VERSION_TEXT, CCACHE_NAME, CCACHE_VERSION);

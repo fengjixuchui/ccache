@@ -78,6 +78,7 @@ enum class ConfigItem {
   run_second_cpp,
   sloppiness,
   stats,
+  stats_log,
   temporary_dir,
   umask,
 };
@@ -119,6 +120,7 @@ const std::unordered_map<std::string, ConfigItem> k_config_key_table = {
   {"run_second_cpp", ConfigItem::run_second_cpp},
   {"sloppiness", ConfigItem::sloppiness},
   {"stats", ConfigItem::stats},
+  {"stats_log", ConfigItem::stats_log},
   {"temporary_dir", ConfigItem::temporary_dir},
   {"umask", ConfigItem::umask},
 };
@@ -161,6 +163,7 @@ const std::unordered_map<std::string, std::string> k_env_variable_table = {
   {"RECACHE", "recache"},
   {"SLOPPINESS", "sloppiness"},
   {"STATS", "stats"},
+  {"STATSLOG", "stats_log"},
   {"TEMPDIR", "temporary_dir"},
   {"UMASK", "umask"},
 };
@@ -275,6 +278,8 @@ parse_sloppiness(const std::string& value)
       result |= SLOPPY_LOCALE;
     } else if (token == "modules") {
       result |= SLOPPY_MODULES;
+    } else if (token == "ivfsoverlay") {
+      result |= SLOPPY_IVFSOVERLAY;
     } // else: ignore unknown value for forward compatibility
     start = value.find_first_not_of(", ", end);
   }
@@ -314,6 +319,9 @@ format_sloppiness(uint32_t sloppiness)
   }
   if (sloppiness & SLOPPY_MODULES) {
     result += "modules, ";
+  }
+  if (sloppiness & SLOPPY_IVFSOVERLAY) {
+    result += "ivfsoverlay, ";
   }
   if (!result.empty()) {
     // Strip last ", ".
@@ -627,6 +635,9 @@ Config::get_string_value(const std::string& key) const
   case ConfigItem::stats:
     return format_bool(m_stats);
 
+  case ConfigItem::stats_log:
+    return m_stats_log;
+
   case ConfigItem::temporary_dir:
     return m_temporary_dir;
 
@@ -864,6 +875,10 @@ Config::set_item(const std::string& key,
 
   case ConfigItem::stats:
     m_stats = parse_bool(value, env_var_key, negate);
+    break;
+
+  case ConfigItem::stats_log:
+    m_stats_log = Util::expand_environment_variables(value);
     break;
 
   case ConfigItem::temporary_dir:

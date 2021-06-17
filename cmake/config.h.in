@@ -6,6 +6,11 @@
 #  endif
 #endif
 
+#ifdef __MINGW32__
+#  define __USE_MINGW_ANSI_STDIO 1
+#  define __STDC_FORMAT_MACROS 1
+#endif
+
 // For example for vasprintf under i686-w64-mingw32-g++-posix. The later
 // definition of _XOPEN_SOURCE disables certain features on Linux, so we need
 // _GNU_SOURCE to re-enable them (makedev, tm_zone).
@@ -34,6 +39,9 @@
 #  define _XOPEN_SOURCE 500
 #elif defined(__FreeBSD__)
 #  define _XOPEN_SOURCE 700
+#elif defined(__ibmxl__) && defined(__clang__) // Compiler xlclang
+#  define _XOPEN_SOURCE 600
+#  define _ALL_SOURCE 1
 #elif !defined(__SunOS_5_11) && !defined(__APPLE__)
 #  define _XOPEN_SOURCE
 #endif
@@ -165,3 +173,9 @@
 
 // Define if you have the "PTHREAD_MUTEX_ROBUST" constant.
 #cmakedefine HAVE_PTHREAD_MUTEX_ROBUST
+
+#if defined(__ibmxl__) && defined(__clang__) // Compiler xlclang
+#  undef HAVE_VARARGS_H // varargs.h would hide macros of stdarg.h
+#  undef HAVE_STRUCT_STAT_ST_CTIM
+#  undef HAVE_STRUCT_STAT_ST_MTIM
+#endif
